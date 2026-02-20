@@ -44,8 +44,10 @@ private enum SmartCardConnections {
 
         static let any = Kind.any(nfcAlertMessage: nil)
 
-        #if os(iOS)
+        #if os(iOS) && !DISABLE_MFI_LIGHTNING
         case lightning
+        #endif
+        #if os(iOS)
         case nfc(alertMessage: String? = nil)
 
         static let nfc = Kind.nfc(alertMessage: nil)
@@ -58,9 +60,11 @@ private enum SmartCardConnections {
         switch kind {
         case .usb:
             return try await USBSmartCardConnection()
-        #if os(iOS)
+        #if os(iOS) && !DISABLE_MFI_LIGHTNING
         case .lightning:
             return try await LightningSmartCardConnection()
+        #endif
+        #if os(iOS)
         case let .nfc(alertMessage):
             return try await NFCSmartCardConnection(alertMessage: alertMessage)
         #endif
@@ -74,7 +78,7 @@ private enum SmartCardConnections {
     private static func wired() async throws(SmartCardConnectionError) -> SmartCardConnection {
         do {
             return try await withThrowingTaskGroup(of: SmartCardConnection.self) { group -> SmartCardConnection in
-                #if os(iOS)
+                #if os(iOS) && !DISABLE_MFI_LIGHTNING
                 if TargetDevice.hasLightningPort {
                     group.addTask {
                         try await LightningSmartCardConnection()

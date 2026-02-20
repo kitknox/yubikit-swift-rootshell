@@ -20,7 +20,13 @@ let package = Package(
     targets: [
         .target(
             name: "YubiKit",
-            path: "YubiKit/YubiKit"
+            path: "YubiKit/YubiKit",
+            swiftSettings: [
+                // TEMPORARY: Disable Lightning/ExternalAccessory to pass App Store review.
+                // Yubico MFI approval pending. Remove this line to restore Lightning support.
+                // See also: ghostty-ios Info.plist, AppStore.xcconfig, Standalone.xcconfig
+                .define("DISABLE_MFI_LIGHTNING"),
+            ]
         ),
         .testTarget(
             name: "YubiKitTests",
