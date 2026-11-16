@@ -15,7 +15,7 @@
 import Foundation
 import Testing
 
-@testable import YubiKit
+@_spi(YubiInternal) @testable import YubiKit
 
 @Suite("WebAuthn UV → PIN Mid-Flight Downgrade", .serialized)
 struct UVFallbackToPINTests {
@@ -30,7 +30,7 @@ struct UVFallbackToPINTests {
 
     @Test("fallbackToPIN closure is non-nil when clientPin set and uv: .preferred")
     func testFallbackExposed() async throws {
-        let mock = MockWebAuthnBackend()
+        let mock = MockCTAP2Backend()
         mock.onGetInfo = { .stub(clientPin: true, userVerification: true, pinUvAuthToken: true) }
         mock.onGetUVRetries = { 3 }
         mock.onGetPinRetries = { .init(retries: 8, powerCycleState: false) }
@@ -80,7 +80,7 @@ struct UVFallbackToPINTests {
 
     @Test("fallbackToPIN is nil under uv: .required")
     func testFallbackSuppressedWhenUVRequired() async throws {
-        let mock = MockWebAuthnBackend()
+        let mock = MockCTAP2Backend()
         mock.onGetInfo = { .stub(clientPin: true, userVerification: true, pinUvAuthToken: true) }
         mock.onGetUVRetries = { 3 }
         mock.onGetPinRetries = { .init(retries: 8, powerCycleState: false) }
@@ -127,7 +127,7 @@ struct UVFallbackToPINTests {
 
     @Test("fallbackToPIN is nil when no clientPin is configured")
     func testFallbackSuppressedWithoutPIN() async throws {
-        let mock = MockWebAuthnBackend()
+        let mock = MockCTAP2Backend()
         mock.onGetInfo = { .stub(clientPin: false, userVerification: true, pinUvAuthToken: true) }
         mock.onGetUVRetries = { 3 }
 
@@ -159,58 +159,13 @@ struct UVFallbackToPINTests {
         }
     }
 
-    // MARK: - cancel without fallback throws .cancelled
-
-    @Test("cancel without fallback aborts ceremony with .cancelled")
-    func testCancelAbortsCeremony() async throws {
-        let mock = MockWebAuthnBackend()
-        mock.onGetInfo = { .stub(clientPin: true, userVerification: true, pinUvAuthToken: true) }
-        mock.onGetUVRetries = { 3 }
-        mock.onGetPinRetries = { .init(retries: 8, powerCycleState: false) }
-
-        let gate = Promise<Void>()
-        let pinAttempts = Box(0)
-        mock.onGetPinUVTokenUpdates = { method, _, _ in
-            switch method {
-            case .uv:
-                return uvWaitingStream(gate: gate)
-            case .pin:
-                pinAttempts.value += 1
-                return .mocked(
-                    .finished(CTAP2.Token(token: Data(repeating: 0, count: 32), protocolVersion: .v2))
-                )
-            }
-        }
-        mock.onGetAssertion = { _ in .mocked(.finished(.stub(credentialId: Data([0xAA])))) }
-
-        let client = try WebAuthn.Client.make(backend: mock)
-        let auth = WebAuthn.Authorization(providePIN: { .pin("1234") }, uv: .preferred)
-        let stream = await client.getAssertion(Self.options, authorization: auth)
-
-        var caught: WebAuthn.ClientError?
-        do throws(WebAuthn.ClientError) {
-            for try await status in stream {
-                if case .waitingForUserVerification(let cancel, _) = status {
-                    await cancel()
-                }
-            }
-        } catch {
-            caught = error
-        }
-
-        guard case .cancelled = caught else {
-            Issue.record("Expected .cancelled, got \(String(describing: caught))")
-            return
-        }
-        #expect(pinAttempts.value == 0, "PIN path must not run after a plain cancel")
-    }
 }
 
 // MARK: - Test Helpers
 
 /// Builds a `getPinUVTokenUpdates` body that yields `.waitingForUser` and
 /// finalises with `keepaliveCancel` once the gate fulfils.
-private func uvWaitingStream(gate: Promise<Void>) -> CTAP2.StatusStream<CTAP2.Token> {
+func uvWaitingStream(gate: Promise<Void>) -> CTAP2.StatusStream<CTAP2.Token> {
     CTAP2.StatusStream<CTAP2.Token> { continuation in
         Task {
             continuation.yield(.waitingForUser(cancel: { await gate.fulfill(()) }))

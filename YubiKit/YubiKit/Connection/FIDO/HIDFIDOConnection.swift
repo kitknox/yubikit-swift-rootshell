@@ -15,28 +15,33 @@
 #if os(macOS)
 
 import Foundation
+import Logging
 import IOKit
 import IOKit.hid
 
 /// HID device identification namespace.
 ///
 /// Contains types for identifying and working with YubiKey HID devices.
-enum HID {
+public enum HID {
     /// Represents a YubiKey device accessible via USB HID.
     ///
-    /// Instances are returned by ``HIDFIDOConnection/availableDevices()`` and used to create
-    /// connections with ``HIDFIDOConnection/init(device:)``.
-    struct YubiKeyDevice: Sendable, Hashable, CustomStringConvertible {
+    /// Instances are returned by ``HIDFIDOConnection/availableDevices(matching:)`` and used to create
+    /// connections with ``HIDFIDOConnection/makeConnection(device:)``.
+    public struct YubiKeyDevice: Sendable, Hashable, CustomStringConvertible {
         /// The human-readable name of the YubiKey device.
-        let name: String
+        public let name: String
+        let usbProductID: UInt16?
+        let usbVendorID: UInt16?
 
         /// A textual representation of the YubiKey device.
-        var description: String { name }
+        public var description: String { name }
 
-        // Private / Fileprivate
-        fileprivate let locationID: Int
+        /// The USB location shared by the FIDO and OTP interfaces of the same device.
+        public let locationID: Int
 
-        fileprivate init(hidLocationID: Int, name: String) {
+        init(hidLocationID: Int, name: String, usbProductID: UInt16? = nil, usbVendorID: UInt16? = nil) {
+            self.usbVendorID = usbVendorID
+            self.usbProductID = usbProductID
             self.locationID = hidLocationID
             self.name = name
         }
@@ -47,7 +52,9 @@ enum HID {
 public struct HIDFIDOConnection: Sendable, FIDOConnection {
 
     /// The HID device this connection is associated with.
-    let device: HID.YubiKeyDevice
+    public let device: HID.YubiKeyDevice
+
+    var usbProductID: UInt16? { device.usbProductID }
 
     /// Maximum packet size for HID reports.
     ///
@@ -60,21 +67,27 @@ public struct HIDFIDOConnection: Sendable, FIDOConnection {
 
     /// Returns all available YubiKey devices connected via USB HID.
     ///
+    /// - Parameter matching: A case-insensitive substring, or `nil` for every YubiKey.
     /// - Returns: An array of ``HID/YubiKeyDevice`` instances representing connected YubiKeys.
     /// - Throws: ``FIDOConnectionError`` if device enumeration fails.
-    static func availableDevices() async throws(FIDOConnectionError) -> [HID.YubiKeyDevice] {
-        try await HIDConnectionManager.shared.availableDevices()
+    public static func availableDevices(
+        matching: String? = nil
+    ) async throws(FIDOConnectionError) -> [HID.YubiKeyDevice] {
+        let devices = try await HIDConnectionManager.shared.availableDevices()
+        guard let matching else { return devices }
+        return devices.filter { $0.name.localizedCaseInsensitiveContains(matching) }
     }
 
     /// Creates a new FIDO connection to the first available YubiKey.
     ///
-    /// Waits for a YubiKey to be connected via USB and establishes a FIDO connection to it.
-    /// This method waits until a YubiKey becomes available.
+    /// Waits until a YubiKey becomes available, then establishes a FIDO connection to it.
     ///
-    /// - Throws: ``FIDOConnectionError/noDevicesFound`` if no YubiKey is available.
+    /// - Throws: ``FIDOConnectionError/cancelled`` if the task is cancelled while waiting,
+    ///   or another ``FIDOConnectionError`` if discovery or connection setup fails.
     public init() async throws(FIDOConnectionError) {
-        guard let first = try await HIDFIDOConnection.availableDevices().first else {
-            throw FIDOConnectionError.noDevicesFound
+        let first = try await waitForDevice(cancellationError: FIDOConnectionError.cancelled) {
+            () async throws(FIDOConnectionError) in
+            try await Self.availableDevices()
         }
         try await self.init(device: first)
     }
@@ -83,10 +96,15 @@ public struct HIDFIDOConnection: Sendable, FIDOConnection {
     ///
     /// Establishes a connection to the specified YubiKey device.
     ///
-    /// - Parameter device: The ``HID.YubiKeyDevice`` to connect to.
+    /// - Parameter device: A device returned by ``availableDevices(matching:)``.
     /// - Throws: ``FIDOConnectionError`` if the device cannot be accessed.
-    init(device: HID.YubiKeyDevice) async throws(FIDOConnectionError) {
+    public init(device: HID.YubiKeyDevice) async throws(FIDOConnectionError) {
+        guard !Task.isCancelled else { throw .cancelled }
         try await HIDConnectionManager.shared.open(device: device)
+        if Task.isCancelled {
+            await HIDConnectionManager.shared.close(locationID: device.locationID, error: FIDOConnectionError.cancelled)
+            throw .cancelled
+        }
         self.device = device
     }
 
@@ -95,7 +113,7 @@ public struct HIDFIDOConnection: Sendable, FIDOConnection {
     /// - Parameter device: The ``HID/YubiKeyDevice`` to connect to.
     /// - Returns: A fully-established connection ready for FIDO communication.
     /// - Throws: ``FIDOConnectionError`` if the device cannot be accessed.
-    static func makeConnection(
+    public static func makeConnection(
         device: HID.YubiKeyDevice
     ) async throws(FIDOConnectionError) -> HIDFIDOConnection {
         try await HIDFIDOConnection(device: device)
@@ -112,16 +130,30 @@ public struct HIDFIDOConnection: Sendable, FIDOConnection {
     ///
     /// - Returns: An error if the connection was closed due to an error, or `nil` if closed normally.
     public func waitUntilClosed() async -> Error? {
-        try? await HIDConnectionManager.shared.didClose(for: locationID).value()
+        logger.debug("Waiting for HID connection to close")
+        let error = try? await HIDConnectionManager.shared.didClose(for: locationID).value()
+        if let error {
+            logger.debug(
+                "HID connection closed with an error",
+                metadata: [
+                    "errorType": .string(String(reflecting: type(of: error))),
+                    "errorDomain": .string((error as NSError).domain),
+                    "errorCode": .stringConvertible((error as NSError).code),
+                ]
+            )
+        } else {
+            logger.debug("HID connection closed")
+        }
+        return error
     }
 
     /// Creates a new FIDO connection to the first available YubiKey.
     ///
-    /// Waits for a YubiKey to be connected via USB and establishes a FIDO connection to it.
-    /// This method waits until a YubiKey becomes available.
+    /// Waits until a YubiKey becomes available, then establishes a FIDO connection to it.
     ///
     /// - Returns: A fully–established connection ready for FIDO communication.
-    /// - Throws: ``FIDOConnectionError/noDevicesFound`` if no YubiKey is available.
+    /// - Throws: ``FIDOConnectionError/cancelled`` if the task is cancelled while waiting,
+    ///   or another ``FIDOConnectionError`` if discovery or connection setup fails.
     public static func makeConnection() async throws(FIDOConnectionError) -> HIDFIDOConnection {
         try await HIDFIDOConnection()
     }
@@ -142,6 +174,8 @@ public struct HIDFIDOConnection: Sendable, FIDOConnection {
         try await HIDConnectionManager.shared.receivePacket(from: locationID)
     }
 }
+
+extension HIDFIDOConnection: HasFIDOLogger {}
 
 // MARK: - Private helpers
 
@@ -192,9 +226,16 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
                     let locationID = IOHIDDeviceGetProperty(dev, kIOHIDLocationIDKey as CFString) as? Int,
                     let name = IOHIDDeviceGetProperty(dev, kIOHIDProductKey as CFString) as? String
                 else { return nil }
-                return HID.YubiKeyDevice(hidLocationID: locationID, name: name)
+                let pid = IOHIDDeviceGetProperty(dev, kIOHIDProductIDKey as CFString) as? Int
+                let vid = IOHIDDeviceGetProperty(dev, kIOHIDVendorIDKey as CFString) as? Int
+                return HID.YubiKeyDevice(
+                    hidLocationID: locationID,
+                    name: name,
+                    usbProductID: pid.flatMap(UInt16.init(exactly:)),
+                    usbVendorID: vid.flatMap(UInt16.init(exactly:))
+                )
             }
-            /* Fix trace: self.trace(message: "found \(yubikeys.count) FIDO HID devices") */
+            self.logger.debug("Enumerated FIDO HID devices", metadata: ["count": .stringConvertible(yubikeys.count)])
             return yubikeys
         }
     }
@@ -209,29 +250,38 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
     }
 
     func open(device: HID.YubiKeyDevice) async throws(FIDOConnectionError) {
-        /* Fix trace: trace(message: "opening connection to \(device.name)") */
+        logger.debug("Opening HID connection")
         try await runloop.perform {
             self.openDeviceInternal(device)
         }
-        /* Fix trace: trace(message: "connection established to \(device.name)") */
+        logger.debug("HID connection established")
     }
 
     func sendPacket(_ packet: Data, to locationID: Int) async throws(FIDOConnectionError) {
-        /* Fix trace: trace(message: "sending \(packet.count) bytes") */
+        logger.debug("Sending HID packet", metadata: ["bytes": .stringConvertible(packet.count)])
         try await runloop.perform {
             self.sendPacketInternal(packet, to: locationID)
         }
     }
 
     func receivePacket(from locationID: Int) async throws(FIDOConnectionError) -> Data {
-        /* Fix trace: trace(message: "waiting for data") */
+        logger.debug("Waiting for HID packet")
         let promise = try await runloop.perform {
             self.receivePacketInternal(from: locationID)
         }
 
         do {
-            let data = try await promise.value()
-            /* Fix trace: trace(message: "received \(data.count) bytes") */
+            let data = try await withTaskCancellationHandler {
+                try await promise.value()
+            } onCancel: {
+                Task {
+                    let withdrawn = await self.runloop.perform {
+                        self.withdrawPendingReceive(promise, from: locationID)
+                    }
+                    await withdrawn?.cancel(with: FIDOConnectionError.cancelled)
+                }
+            }
+            logger.debug("Received HID packet", metadata: ["bytes": .stringConvertible(data.count)])
             return data
         } catch let error as FIDOConnectionError {
             throw error
@@ -241,7 +291,18 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
     }
 
     func close(locationID: Int, error: Error?) async {
-        /* Fix trace: trace(message: "closing connection, error: \(String(describing: error))") */
+        if let error {
+            logger.debug(
+                "Closing HID connection with an error",
+                metadata: [
+                    "errorType": .string(String(reflecting: type(of: error))),
+                    "errorDomain": .string((error as NSError).domain),
+                    "errorCode": .stringConvertible((error as NSError).code),
+                ]
+            )
+        } else {
+            logger.debug("Closing HID connection")
+        }
         await runloop.perform {
             self.closeInternal(locationID: locationID, error: error)
         }
@@ -252,6 +313,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
     private let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
     private let filter: [String: Any] = [
+        kIOHIDVendorIDKey as String: 0x1050,
         kIOHIDDeviceUsagePageKey as String: 0xF1D0,
         kIOHIDDeviceUsageKey as String: 0x01,
     ]
@@ -283,6 +345,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
                 // Remove from open connections and notify
                 if let locationID = IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString) as? Int {
                     if let connection = me.openConnections.removeValue(forKey: locationID) {
+                        me.logger.debug("HID device disconnected")
                         me.teardownConnection(connection, closeError: nil)
                     }
                 }
@@ -292,14 +355,11 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
 
         let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard openResult == kIOReturnSuccess else {
-            /* Fix trace: trace(
-                message:
-                    "IOHIDManagerOpen failed with result: 0x\(String(format: "%08X", openResult)) – likely missing entitlements"
-            ) */
+            logger.warning("Failed to open HID manager", metadata: ["status": .stringConvertible(openResult)])
             return
         }
 
-        /* Fix trace: trace(message: "HID manager opened successfully") */
+        logger.debug("HID manager opened")
     }
 
     // MARK: - Internal HID Operations (Must run on HID thread)
@@ -315,7 +375,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
     private func openDeviceInternal(_ device: HID.YubiKeyDevice) -> Result<Void, FIDOConnectionError> {
         // Check if device is already connected
         if openConnections[device.locationID] != nil {
-            /* Fix trace: trace(message: "device already connected – throwing .busy") */
+            logger.debug("HID device is already connected")
             return .failure(.busy)
         }
 
@@ -325,13 +385,13 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
         })
 
         guard let ioDev = ioDevice else {
-            /* Fix trace: trace(message: "failed to get HID device") */
+            logger.debug("HID device is no longer available")
             return .failure(.setupFailed("Failed to get HID device"))
         }
 
         let openResult = IOHIDDeviceOpen(ioDev, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
         guard openResult == kIOReturnSuccess else {
-            /* Fix trace: trace(message: "IOHIDDeviceOpen failed with result: 0x\(String(format: "%08X", openResult))") */
+            logger.debug("Failed to open HID device", metadata: ["status": .stringConvertible(openResult)])
             return .failure(.setupFailed("Failed to open HID device"))
         }
 
@@ -354,14 +414,13 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
         IOHIDDeviceScheduleWithRunLoop(ioDev, runloop!, CFRunLoopMode.defaultMode.rawValue)
 
         openConnections[device.locationID] = connectionState
-        /* Fix trace: trace(message: "device opened successfully") */
 
         return .success(())
     }
 
     private func closeInternal(locationID: Int, error: Error?) {
         guard let connectionState = openConnections.removeValue(forKey: locationID) else {
-            /* Fix trace: trace(message: "no connection found") */
+            logger.debug("HID connection is already closed")
             return
         }
 
@@ -383,8 +442,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
         IOHIDDeviceUnscheduleFromRunLoop(connection.device, runloop!, CFRunLoopMode.defaultMode.rawValue)
 
         let didClose = connection.didClose
-        let pendingReceive = connection.pendingReceive
-        connection.pendingReceive = nil
+        let pendingReceive = connection.packetQueue.cancelPendingReceive()
         Task { @Sendable in
             await pendingReceive?.cancel(with: FIDOConnectionError.connectionLost)
             await didClose.fulfill(closeError)
@@ -393,17 +451,20 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
 
     private func sendPacketInternal(_ packet: Data, to locationID: Int) -> Result<Void, FIDOConnectionError> {
         guard packet.count <= hidPayloadSize else {
-            /* Fix trace: trace(message: "packet too large: \(packet.count) > \(hidPayloadSize)") */
+            logger.debug(
+                "HID packet exceeds report size",
+                metadata: ["bytes": .stringConvertible(packet.count), "maximum": .stringConvertible(hidPayloadSize)]
+            )
             return .failure(.transmitFailed("HID transmit failed"))
         }
         guard let connectionState = openConnections[locationID] else {
-            /* Fix trace: trace(message: "no connection – throwing .connectionLost") */
+            logger.debug("Cannot send on a closed HID connection")
             return .failure(.connectionLost)
         }
         let dev = connectionState.device
 
         // Send packet directly to HID device
-        /* Fix trace: trace(message: "sending HID report directly (\(packet.count) bytes)") */
+        logger.debug("Sending HID output report", metadata: ["bytes": .stringConvertible(packet.count)])
         let result = packet.withUnsafeBytes {
             IOHIDDeviceSetReport(
                 dev,
@@ -414,7 +475,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
             )
         }
         guard result == kIOReturnSuccess else {
-            /* Fix trace: trace(message: "IOHIDDeviceSetReport failed with result: 0x\(String(format: "%08X", result))") */
+            logger.debug("HID report transmission failed", metadata: ["status": .stringConvertible(result)])
             return .failure(.transmitFailed("HID transmit failed"))
         }
 
@@ -426,20 +487,12 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
             return .failure(FIDOConnectionError.connectionLost)
         }
 
-        // Check if we already have queued frames - deliver the oldest one immediately
-        if !connectionState.receivedFrames.isEmpty {
-            let frame = connectionState.receivedFrames.removeFirst()
-            let promise = Promise<Data>()
-            Task { @Sendable in
-                await promise.fulfill(frame)
-            }
-            return .success(promise)
-        }
+        return connectionState.packetQueue.receive()
+    }
 
-        // No queued frames - create a new promise to wait for incoming data
-        let promise = Promise<Data>()
-        connectionState.pendingReceive = promise
-        return .success(promise)
+    private func withdrawPendingReceive(_ promise: Promise<Data>, from locationID: Int) -> Promise<Data>? {
+        guard let state = openConnections[locationID] else { return nil }
+        return state.packetQueue.withdraw(promise)
     }
 
     // MARK: - Connection State
@@ -449,11 +502,7 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
         let device: IOHIDDevice
         let didClose: Promise<Error?>
 
-        // Queue of received input reports waiting to be consumed
-        var receivedFrames: [Data] = []
-
-        // Promise for the next input report
-        var pendingReceive: Promise<Data>?
+        let packetQueue = HIDPacketQueue()
 
         // HID input report buffer
         var inputBuffer = [UInt8](repeating: 0, count: hidPayloadSize)
@@ -484,28 +533,62 @@ private final class HIDConnectionManager: @unchecked Sendable, HasFIDOLogger {
 
     // Handle input report from callback
     private func handleInputReport(_ data: Data, from sender: UnsafeMutableRawPointer?) {
+        logger.debug("Received HID input report", metadata: ["bytes": .stringConvertible(data.count)])
 
-        /* Fix trace: trace(message: "received input report of size \(data.count)") */
         guard data.count >= 1 else { return }
         // Find connection by matching the device pointer
         for (_, connectionState) in openConnections {
             if Unmanaged.passUnretained(connectionState.device).toOpaque() == sender {
-                // If there's a pending receive promise, fulfill it immediately
-                if let promise = connectionState.pendingReceive {
-                    connectionState.pendingReceive = nil
+                if let promise = connectionState.packetQueue.enqueue(data) {
                     // Return the full 64-byte HID report
                     Task { @Sendable in
                         await promise.fulfill(data)
                     }
-                } else {
-                    // No pending promise - queue the frame for later
-                    connectionState.receivedFrames.append(data)
                 }
                 return
             }
         }
 
-        /* Fix trace: trace(message: "received report for unknown device") */
+        logger.debug("Ignoring HID report for an unknown device")
+    }
+}
+
+// Only the HID manager's run loop mutates this queue.
+final class HIDPacketQueue {
+    private var receivedFrames: [Data] = []
+    private var pendingReceive: Promise<Data>?
+
+    func receive() -> Result<Promise<Data>, FIDOConnectionError> {
+        guard pendingReceive == nil else { return .failure(.busy) }
+
+        let promise = Promise<Data>()
+        if !receivedFrames.isEmpty {
+            let frame = receivedFrames.removeFirst()
+            Task { @Sendable in await promise.fulfill(frame) }
+        } else {
+            pendingReceive = promise
+        }
+        return .success(promise)
+    }
+
+    func withdraw(_ promise: Promise<Data>) -> Promise<Data>? {
+        guard pendingReceive === promise else { return nil }
+        pendingReceive = nil
+        return promise
+    }
+
+    func enqueue(_ frame: Data) -> Promise<Data>? {
+        guard let promise = pendingReceive else {
+            receivedFrames.append(frame)
+            return nil
+        }
+        pendingReceive = nil
+        return promise
+    }
+
+    func cancelPendingReceive() -> Promise<Data>? {
+        defer { pendingReceive = nil }
+        return pendingReceive
     }
 }
 

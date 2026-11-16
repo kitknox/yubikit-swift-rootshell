@@ -14,19 +14,32 @@
 
 import CryptoTokenKit
 import Foundation
-import OSLog
+import Logging
 
 // Internal helper for SmartCard APDU communication with optional SCP encryption.
 // Handles application selection, SCP setup, and APDU transmission with automatic continuation.
-public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
+public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable, HasSmartCardLogger {
     typealias Connection = SmartCardConnection
 
     let connection: Connection
     let scpState: SCPState?
     let selectResponse: Data
+    private var maxAPDUSize = 261
+    private let commandMutex = AsyncMutex()
+
+    func setAPDUSizeLimit(for version: Version) {
+        switch version.resolvingDevelopment {
+        case ..<Version("4.0.0")!: maxAPDUSize = 261
+        case ..<Version("4.3.0")!: maxAPDUSize = 2038
+        case ..<Version("6.0.0")!: maxAPDUSize = 3062
+        default: maxAPDUSize = 4918
+        }
+    }
 
     // Flag to signal cancellation for CTAP operations over NFC
     internal var shouldCancelCTAP: Bool = false
+    private let ctapOperationGate = CTAPOperationGate()
+    private var activeCTAPOperationID: UUID?
 
     // Maximum message size for CTAP operations (CBORInterface)
     // NEXTMAJOR: Change type to UInt to match GetInfoResponse.maxMsgSize (CTAP spec defines this as unsigned)
@@ -44,7 +57,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         keyParams: SCPKeyParams? = nil,
         insSendRemaining: UInt8 = 0xc0
     ) async throws(Error) {
+        guard !Task.isCancelled else {
+            throw .connectionError(.cancelled, source: .here())
+        }
         self.connection = connection
+
+        Self.logger.debug("Selecting application", metadata: ["application": .string(String(describing: application))])
 
         // Select application
         do {
@@ -73,6 +91,7 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
                 keyParams: keyParams,
                 insSendRemaining: insSendRemaining
             )
+            SCPState.logger.info("SCP initialized")
         } else {
             scpState = nil
         }
@@ -88,8 +107,43 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
 
     // Sets a flag that will cause the next GET_RESPONSE poll to send P1_CANCEL_KEEP_ALIVE
     // instead of P1_KEEP_ALIVE, signaling the authenticator to abort the operation.
-    func cancel() async throws(Error) where Error == CTAP2.SessionError {
+    func cancel(operationID: UUID) {
+        guard activeCTAPOperationID == operationID else { return }
+        CTAP2.Session.logger.debug("Requesting CTAP cancellation...")
         shouldCancelCTAP = true
+    }
+
+    func makeCTAPCancelHandler(operationID: UUID) -> @Sendable () async -> Void {
+        { [weak self] in
+            await self?.cancel(operationID: operationID)
+        }
+    }
+
+    func withExclusiveCTAPOperation<T: Sendable>(
+        cancellationError: Error? = nil,
+        _ operation: (UUID) async throws(Error) -> T
+    ) async throws(Error) -> T {
+        let operationID = UUID()
+        guard await ctapOperationGate.acquire(operationID) else {
+            throw cancellationError ?? Error.connectionError(.cancelled, source: .here())
+        }
+
+        activeCTAPOperationID = operationID
+        let result: Result<T, Error>
+        do throws(Error) {
+            result = .success(try await operation(operationID))
+        } catch {
+            result = .failure(error)
+        }
+        finishCTAPOperation(operationID)
+        await ctapOperationGate.release(operationID)
+        return try result.get()
+    }
+
+    private func finishCTAPOperation(_ operationID: UUID) {
+        guard activeCTAPOperationID == operationID else { return }
+        activeCTAPOperationID = nil
+        shouldCancelCTAP = false
     }
 
     // Internal variant that returns full Response and throws on non-success status.
@@ -97,6 +151,23 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         apdu: APDU,
         insSendRemaining: UInt8 = 0xc0,
     ) async throws(Error) -> Response {
+        guard await commandMutex.acquire() else { throw .connectionError(.cancelled, source: .here()) }
+        defer { commandMutex.release() }
+        return try await sendLocked(apdu: apdu, insSendRemaining: insSendRemaining)
+    }
+
+    // Finish an admitted exchange even if its caller is cancelled while waiting for the mutex.
+    internal func sendContinuingExchange(
+        apdu: APDU,
+        insSendRemaining: UInt8 = 0xc0,
+    ) async throws(Error) -> Response {
+        let acquired = await Task { await commandMutex.acquire() }.value
+        guard acquired else { throw .connectionError(.cancelled, source: .here()) }
+        defer { commandMutex.release() }
+        return try await sendLocked(apdu: apdu, insSendRemaining: insSendRemaining)
+    }
+
+    private func sendLocked(apdu: APDU, insSendRemaining: UInt8) async throws(Error) -> Response {
         let response: Response
         if let scpState {
             response = try await sendWithSCP(apdu: apdu, scpState: scpState, insSendRemaining: insSendRemaining)
@@ -117,6 +188,11 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         scpState: SCPState,
         insSendRemaining: UInt8
     ) async throws(Error) -> Response {
+        // The virtual APDU used for the MAC still has a 16-bit length field.
+        let count = apdu.command?.count ?? 0
+        guard (count / 16 + 1) * 16 + 8 <= Int(UInt16.max) else {
+            throw .illegalArgument("Command too large for secure messaging", source: .here())
+        }
         // Encrypt command data
         let data: Data
         do {
@@ -150,8 +226,11 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         var result = response.data
         let sw = response.responseStatus.rawStatus
 
-        // Verify and remove MAC from response
-        if !result.isEmpty {
+        // SCP03 §6.2.5 requires R-MAC for success and warnings, even without response data.
+        // Bare error statuses remain unauthenticated. SCP03 setup uses a separate handshake path.
+        if !result.isEmpty || response.status == .ok || response.responseStatus.sw1 == 0x62
+            || response.responseStatus.sw1 == 0x63
+        {
             do {
                 result = try await scpState.unmac(data: result, sw: sw)
             } catch {
@@ -175,27 +254,89 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
     // Send APDU without SCP.
     // Returns the response with status code (status check happens in caller).
     private func sendPlain(apdu: APDU, insSendRemaining: UInt8) async throws(Error) -> Response {
-        try await Self.sendWithContinuationStatic(
+        try await Self.sendCommandStatic(
             connection: connection,
             apdu: apdu,
+            maxAPDUSize: maxAPDUSize,
+            insSendRemaining: insSendRemaining
+        )
+    }
+
+    // Split the logical command before encoding any physical APDU.
+    private static func sendCommandStatic(
+        connection: SmartCardConnection,
+        apdu: APDU,
+        maxAPDUSize: Int,
+        insSendRemaining: UInt8
+    ) async throws(Error) -> Response {
+        let command = apdu.command ?? Data()
+        var finalAPDU = apdu
+        if command.count > 255 && command.count > maxAPDUSize - 7 {
+            var offset = command.startIndex
+            while command.endIndex - offset > 255 {
+                let end = offset + 255
+                let part = APDU(
+                    cla: apdu.cla | 0x10,
+                    ins: apdu.ins,
+                    p1: apdu.p1,
+                    p2: apdu.p2,
+                    command: command.subdata(in: offset..<end)
+                )
+                let raw: Data
+                do {
+                    raw = try await connection.send(data: part.data)
+                } catch {
+                    throw .connectionError(error, source: .here())
+                }
+                guard raw.count >= 2 else {
+                    throw .responseParseError("Response too short for a status word", source: .here())
+                }
+                let response = Response(rawData: raw)
+                guard response.status == .ok else { return response }
+                offset = end
+            }
+            finalAPDU = APDU(
+                cla: apdu.cla,
+                ins: apdu.ins,
+                p1: apdu.p1,
+                p2: apdu.p2,
+                command: command.subdata(in: offset..<command.endIndex)
+            )
+        }
+        return try await sendWithContinuationStatic(
+            connection: connection,
+            apdu: finalAPDU,
             accumulated: Data(),
             readMoreData: false,
             insSendRemaining: insSendRemaining
         )
     }
 
+    // NEO requires this raw command to leave Management before selecting another application.
+    internal func deselectNEOManagement() async throws(Error) {
+        guard !Task.isCancelled else {
+            throw .connectionError(.cancelled, source: .here())
+        }
+
+        do {
+            _ = try await connection.send(data: Data([0xa4, 0x04, 0x00, 0x08]))
+        } catch {
+            throw .connectionError(error, source: .here())
+        }
+    }
+
     // Send APDU without SCP (static version).
     // Used during actor init before instance methods are available.
-    private static func sendPlainStatic(
+    internal static func sendPlainStatic(
         connection: SmartCardConnection,
         apdu: APDU,
         insSendRemaining: UInt8
     ) async throws(Error) -> Data {
-        let response = try await sendWithContinuationStatic(
+        let response = try await sendCommandStatic(
             connection: connection,
             apdu: apdu,
-            accumulated: Data(),
-            readMoreData: false,
+            // Firmware limits are not known during selection and SCP setup.
+            maxAPDUSize: 261,
             insSendRemaining: insSendRemaining
         )
         guard response.status == .ok else {
@@ -228,7 +369,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
             throw .connectionError(error, source: .here())
         }
 
-        // Parse response status
+        guard responseData.count >= 2 else {
+            throw .responseParseError(
+                "Response too short: expected at least 2 bytes, got \(responseData.count)",
+                source: .here()
+            )
+        }
         let response = Response(rawData: responseData)
 
         // Only continue accumulation for 0x61 (more data) or 0x9000 (success)
@@ -294,6 +440,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         staticKeys: StaticKeys,
         insSendRemaining: UInt8
     ) async throws(Error) -> SCPState {
+        SCPState.logger.debug(
+            "Initializing SCP03 handshake",
+            metadata: [
+                "kid": .stringConvertible(keyParams.keyRef.kid), "kvn": .stringConvertible(keyParams.keyRef.kvn),
+            ]
+        )
         let hostChallenge: Data
         do {
             hostChallenge = try Data.random(length: 8)
@@ -322,7 +474,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         }
 
         let context = hostChallenge + cardChallenge
-        let sessionKeys = staticKeys.derive(context: context)
+        let sessionKeys: SCPSessionKeys
+        do {
+            sessionKeys = try staticKeys.derive(context: context)
+        } catch {
+            throw .cryptoError("Failed to derive SCP03 session keys", error: error, source: .here())
+        }
 
         let genCardCryptogram: Data
         do {
@@ -363,6 +520,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
         scp11Params: SCP11KeyParams,
         insSendRemaining: UInt8
     ) async throws(Error) -> SCPState {
+        SCPState.logger.debug(
+            "Initializing SCP11 handshake",
+            metadata: [
+                "kid": .stringConvertible(keyParams.keyRef.kid), "kvn": .stringConvertible(keyParams.keyRef.kvn),
+            ]
+        )
         let kid = keyParams.keyRef.kid
 
         let params: UInt8
@@ -386,7 +549,12 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
 
             let oceRef = scp11Params.oceKeyRef ?? SCPKeyRef(kid: 0x00, kvn: 0x00)
 
+            SCPState.logger.debug("Sending certificate chain")
             for (index, cert) in certificates.enumerated() {
+                SCPState.logger.debug(
+                    "Sending certificate",
+                    metadata: ["index": .stringConvertible(index + 1), "count": .stringConvertible(certificates.count)]
+                )
                 let p2: UInt8 = oceRef.kid | (index < certificates.count - 1 ? 0x80 : 0x00)
                 _ = try await sendPlainStatic(
                     connection: connection,
@@ -457,6 +625,7 @@ public final actor SmartCardInterface<Error: SmartCardSessionError>: Sendable {
             throw .dataProcessingError("Unable to parse EC public key", source: .here())
         }
 
+        SCPState.logger.debug("Performing key agreement")
         let keyAgreement1: Data
         let keyAgreement2: Data
         do {
@@ -550,6 +719,8 @@ extension Application {
             data = Data([0xA0, 0x00, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00])
         case .fido2:
             data = Data([0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01])
+        case .otp:
+            data = Data([0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01, 0x01])
         }
 
         return APDU(cla: 0x00, ins: 0xa4, p1: 0x04, p2: 0x00, command: data)

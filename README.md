@@ -10,8 +10,9 @@ Swift SDK for YubiKey integration on iOS and macOS.
 
 This repository is the [rootshell](https://www.rootshell.com)-maintained fork
 of [Yubico/yubikit-swift](https://github.com/Yubico/yubikit-swift), based on
-upstream `v1.3.0`. It is maintained independently and does not automatically
-track subsequent upstream changes.
+upstream's `release/1.5.0` branch, ahead of Yubico's 1.5.0 release. It is
+maintained independently and does not automatically track subsequent upstream
+changes.
 
 The `YubiKit` module and product names remain unchanged. This fork is used by
 rootshell but remains an independently usable Swift package. It is not an
@@ -20,10 +21,8 @@ official Yubico project and is not supported by Yubico.
 ## Fork changes
 
 - Lightning/ExternalAccessory support is compiled out while rootshell's MFi
-  approval is pending; NFC and USB-C support are unaffected.
-- USB smart-card connection polling exits promptly when its task is cancelled.
-- PIV PINs longer than eight bytes are rejected instead of triggering a range
-  trap.
+  approval is pending, including in the integration scenarios; NFC and USB-C
+  support are unaffected.
 
 ## Overview
 
@@ -59,7 +58,7 @@ YubiKit uses a layered architecture where the connection layer handles communica
 ```swift
 .package(
     url: "https://github.com/kitknox/yubikit-swift-rootshell.git",
-    exact: "1.3.1"
+    exact: "1.5.0-rootshell.1"
 )
 ```
 
@@ -68,6 +67,10 @@ YubiKit uses a layered architecture where the connection layer handles communica
 - [Getting Started Guide](https://yubico.github.io/yubikit-swift/documentation/yubikit/gettingstarted)
 - [API Documentation](https://yubico.github.io/yubikit-swift/documentation/yubikit/)
 - [Configuration Guide](https://yubico.github.io/yubikit-swift/documentation/yubikit/gettingstarted#preparing-your-project)
+- [Logging](YubiKit/YubiKit/YubiKit.docc/Resources/LoggingGuide.md) — configure diagnostics and transport tracing with SwiftLog.
+
+Use `YubiKit.Logs.configure(logLevel:factory:)` to override the default level or backend.
+Raw traffic logging requires YubiKit to be compiled with `DEBUG` and explicit opt-in at `.trace`.
 
 ## Sample Apps
 

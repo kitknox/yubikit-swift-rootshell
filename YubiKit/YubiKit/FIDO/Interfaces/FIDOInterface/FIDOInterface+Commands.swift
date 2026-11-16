@@ -18,6 +18,20 @@ import Foundation
 
 extension FIDOInterface {
 
+    func makeCancelHandler(
+        operationID: UUID,
+        onError: @escaping @Sendable (Error) -> Void
+    ) -> @Sendable () async -> Void {
+        { [weak self] in
+            guard let self else { return }
+            do throws(Error) {
+                try await self.cancel(operationID: operationID)
+            } catch {
+                onError(error)
+            }
+        }
+    }
+
     /// Test communication by sending data and receiving it back
     ///
     /// The PING command is used to verify that the HID transport is working correctly.
@@ -34,14 +48,14 @@ extension FIDOInterface {
             throw Error.responseParseError("PING response data mismatch", source: .here())
         }
 
-        /* Fix trace: trace(message: "PING command completed: \(response.count) bytes echoed") */
+        logger.debug("PING command completed", metadata: ["bytes": .stringConvertible(response.count)])
         return response
     }
 
     /// Send wink command to the authenticator
     func wink() async throws(Error) {
         _ = try await sendAndReceive(cmd: Self.hidCommand(.wink), payload: nil)
-        /* Fix trace: trace(message: "WINK command completed successfully") */
+        logger.debug("WINK command completed successfully")
     }
 
     /// Lock the channel for exclusive access
@@ -55,7 +69,7 @@ extension FIDOInterface {
         let cappedSeconds = min(seconds, 10)
         let payload = Data([UInt8(cappedSeconds)])
         _ = try await sendAndReceive(cmd: Self.hidCommand(.lock), payload: payload)
-        /* Fix trace: trace(message: "LOCK command completed: \(cappedSeconds) seconds") */
+        logger.debug("LOCK command completed", metadata: ["seconds": .stringConvertible(cappedSeconds)])
     }
 
     /// Release the channel lock
@@ -67,12 +81,30 @@ extension FIDOInterface {
 
     /// Cancel any pending operation on this channel
     ///
-    /// Sends a CANCEL command to abort ongoing operations such as waiting for user interaction.
-    /// This is a one-way message - the authenticator will respond to the original command with
-    /// a keepaliveCancel error rather than responding to the CANCEL command itself.
-    ///
-    /// - Throws: ``FIDOSessionError`` if sending the cancel command fails
-    func cancel() async throws(Error) {
-        try await sendRequest(cmd: Self.hidCommand(.cancel), payload: nil)
+    /// Sends CANCEL for the active operation. Later calls reuse the same send task.
+    func cancel(operationID: UUID) async throws(Error) {
+        guard activeOperationID == operationID else { return }
+
+        let task: Task<Result<Void, Error>, Never>
+        if let cancellationTask {
+            task = cancellationTask
+        } else {
+            task = Task {
+                do throws(Error) {
+                    try await self.sendRequest(cmd: Self.hidCommand(.cancel), payload: nil)
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            cancellationTask = task
+        }
+
+        switch await task.value {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
+        }
     }
 }

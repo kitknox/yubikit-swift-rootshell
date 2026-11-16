@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import Foundation
+import Logging
 
 // MARK: - Session BioEnrollment Accessor
 
@@ -52,9 +53,9 @@ extension CTAP2 {
     /// Allows managing fingerprint enrollments on biometric authenticators (e.g., YubiKey Bio).
     ///
     /// - SeeAlso: [CTAP2 authenticatorBioEnrollment](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#authenticatorBioEnrollment)
-    public struct BioEnrollment: Sendable {
+    public struct BioEnrollment: Sendable, HasFIDOLogger {
 
-        private let session: CTAP2.Session
+        fileprivate let session: CTAP2.Session
         private let token: CTAP2.Token
         private let command: CTAP2.Command
 
@@ -107,6 +108,7 @@ extension CTAP2 {
         ///
         /// - Parameter timeout: Optional timeout in milliseconds for each fingerprint capture.
         /// - Returns: An async sequence that yields samples until enrollment is complete.
+        ///   A new enrollment on the same session waits for any previous enrollment to finish cleanup.
         /// - SeeAlso: [Enrolling Fingerprint](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#enrollingFingerprint)
         public func enroll(timeout: UInt? = nil) -> EnrollFingerprint {
             EnrollFingerprint(bioEnrollment: self, timeout: timeout)
@@ -116,6 +118,7 @@ extension CTAP2 {
         ///
         /// - SeeAlso: [Cancel Current Enrollment](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#cancelCurrentEnrollment)
         public func cancelEnrollment() async throws(CTAP2.SessionError) {
+            logger.debug("Cancelling fingerprint enrollment")
             try await executeNoAuth(subcommand: .cancelCurrentEnrollment) as Void
         }
 
@@ -142,7 +145,12 @@ extension CTAP2 {
                 SubcommandParam.templateId.rawValue: templateId.cbor(),
                 SubcommandParam.templateFriendlyName.rawValue: name.cbor(),
             ]
+            logger.debug(
+                "Changing template name",
+                metadata: ["templateId": .string(templateId.hexEncodedString), "name": .string(name)]
+            )
             try await execute(subcommand: .setFriendlyName, params: params) as Void
+            logger.info("Fingerprint template renamed")
         }
 
         /// Removes a fingerprint enrollment.
@@ -155,7 +163,9 @@ extension CTAP2 {
             let params: [UInt8: CBOR.Value] = [
                 SubcommandParam.templateId.rawValue: templateId.cbor()
             ]
+            logger.debug("Deleting template", metadata: ["templateId": .string(templateId.hexEncodedString)])
             try await execute(subcommand: .removeEnrollment, params: params) as Void
+            logger.info("Fingerprint template deleted")
         }
 
         // MARK: - Private Helpers
@@ -185,6 +195,10 @@ extension CTAP2 {
         private func enrollBegin(
             timeout: UInt? = nil
         ) async -> CTAP2.StatusStream<EnrollBeginResult> {
+            logger.debug(
+                "Starting fingerprint enrollment",
+                metadata: ["timeout": timeout.map { .stringConvertible($0) } ?? .string("unspecified")]
+            )
             var params: [UInt8: CBOR.Value]?
             if let timeout {
                 params = [SubcommandParam.timeoutMilliseconds.rawValue: timeout.cbor()]
@@ -196,6 +210,10 @@ extension CTAP2 {
             templateId: Data,
             timeout: UInt? = nil
         ) async -> CTAP2.StatusStream<CaptureResult> {
+            logger.debug(
+                "Capturing next sample",
+                metadata: ["timeout": timeout.map { .stringConvertible($0) } ?? .string("unspecified")]
+            )
             var params: [UInt8: CBOR.Value] = [
                 SubcommandParam.templateId.rawValue: templateId.cbor()
             ]
@@ -291,7 +309,7 @@ extension CTAP2.BioEnrollment {
     }
 
     /// An async sequence that yields enrollment samples until complete.
-    public struct EnrollFingerprint: AsyncSequence, Sendable {
+    public struct EnrollFingerprint: AsyncSequence, Sendable, HasFIDOLogger {
         public typealias Element = EnrollmentSample
 
         public func makeAsyncIterator() -> Iterator {
@@ -321,6 +339,11 @@ extension CTAP2.BioEnrollment {
 
         fileprivate init(bioEnrollment: CTAP2.BioEnrollment, timeout: UInt?) {
             self.stream = AsyncStream { continuation in
+                guard !Task.isCancelled else {
+                    continuation.finish()
+                    return
+                }
+
                 let task = Task {
                     await Self.run(
                         bioEnrollment: bioEnrollment,
@@ -343,6 +366,13 @@ extension CTAP2.BioEnrollment {
             timeout: UInt?,
             continuation: AsyncStream<Result<EnrollmentSample, CTAP2.SessionError>>.Continuation
         ) async {
+            let operationID = UUID()
+            let operationGate = bioEnrollment.session.bioEnrollmentGate
+            guard await operationGate.acquire(operationID) else {
+                continuation.finish()
+                return
+            }
+
             var completed = false
             do {
                 completed = try await runEnrollment(
@@ -355,8 +385,12 @@ extension CTAP2.BioEnrollment {
             }
             continuation.finish()
             if !completed {
-                try? await bioEnrollment.cancelEnrollment()
+                // Enrollment cleanup must run even though this producer was cancelled.
+                await Task {
+                    try? await bioEnrollment.cancelEnrollment()
+                }.value
             }
+            await operationGate.release(operationID)
         }
 
         /// Returns `true` when enrollment completed successfully, `false` if interrupted or cancelled.
@@ -418,6 +452,13 @@ extension CTAP2.BioEnrollment {
             status: SampleStatus,
             remaining: UInt
         ) -> EnrollmentSample {
+            Self.logger.debug(
+                "Fingerprint sample capture result",
+                metadata: [
+                    "status": .string(String(describing: status)), "remaining": .stringConvertible(remaining),
+                    "templateId": .string(templateId.hexEncodedString),
+                ]
+            )
             if remaining == 0 {
                 return .completed(templateId: templateId, status: status)
             }

@@ -27,11 +27,11 @@ extension FIDOInterface {
         // Send init frame with first chunk of data
         let initFrame = buildInitFrame(channelId: channelId, command: cmd, payload: payloadData)
         do {
+            logger.traceRequest(initFrame)
             try await connection.send(initFrame)
         } catch {
             throw .fidoConnectionError(error, source: .here())
         }
-        /* Fix trace: trace(message: "Sent init frame (\(payloadData.count) total bytes)") */
 
         // If payload is larger than init frame can hold, send continuation frames
         var remainingData = payloadData.dropFirst(CTAP2.INIT_DATA_SIZE)
@@ -44,11 +44,11 @@ extension FIDOInterface {
                 payload: Data(remainingData)
             )
             do {
+                logger.traceRequest(contFrame)
                 try await connection.send(contFrame)
             } catch {
                 throw .fidoConnectionError(error, source: .here())
             }
-            /* Fix trace: trace(message: "Sent continuation frame \(sequence)") */
 
             remainingData = remainingData.dropFirst(CTAP2.CONT_DATA_SIZE)
             sequence += 1
@@ -65,22 +65,19 @@ extension FIDOInterface {
     /// Handles KEEPALIVE messages
     func receiveResponse(
         expectedCommand: UInt8,
+        operationID: UUID,
         onKeepalive: ((UInt8) -> Void)? = nil
     ) async throws(Error) -> Data {
+
+        var lastKeepalive: UInt8?
+        var cancelSent = false
 
         // Loop to handle KEEPALIVE messages
         while true {
             // Read init frame with frame timeout
-            let responseInitFrame: Data?
-            do {
-                responseInitFrame = try await withTimeout(frameTimeout) { try await self.connection.receive() }
-            } catch {
-                throw .fidoConnectionError(error as! FIDOConnectionError, source: .here())
-            }
+            let responseInitFrame = try await receiveFrame()
 
-            guard let responseInitFrame = responseInitFrame else {
-                throw .timeout(source: .here())
-            }
+            logger.traceResponse(responseInitFrame)
 
             let (responseChannelId, responseCommand, payloadLength, initFrameData) = try parseInitFrame(
                 responseInitFrame
@@ -95,7 +92,29 @@ extension FIDOInterface {
             if responseCommand == Self.hidCommand(.keepalive) {
                 if let handler = onKeepalive {
                     let statusByte = initFrameData.first ?? 0
+                    if lastKeepalive != statusByte {
+                        logger.debug(
+                            "Got keepalive status",
+                            metadata: ["status": .string(String(format: "%02x", statusByte))]
+                        )
+                        lastKeepalive = statusByte
+                    }
                     handler(statusByte)
+                    // A cancelled caller stops the touch wait. The loop still reads the final response.
+                    if statusByte == keepaliveUpNeeded,
+                        Task.isCancelled,
+                        !cancelSent
+                    {
+                        cancelSent = true
+                        do throws(Error) {
+                            try await cancel(operationID: operationID)
+                        } catch {
+                            logger.error(
+                                "Failed to cancel CTAP command; continuing to receive its response",
+                                metadata: ["errorType": .string(String(reflecting: type(of: error)))]
+                            )
+                        }
+                    }
                     continue  // Keep waiting for actual response
                 } else {
                     throw Error.responseParseError("Unexpected KEEPALIVE for non-CBOR command", source: .here())
@@ -120,8 +139,6 @@ extension FIDOInterface {
                 )
             }
 
-            /* Fix trace: trace(message: "Received init frame") */
-
             // Start building response payload with data from init frame
             var responsePayload = Data()
             responsePayload.append(initFrameData)
@@ -129,17 +146,9 @@ extension FIDOInterface {
             // If more data expected, read continuation frames
             var expectedSequence: UInt8 = 0
             while responsePayload.count < payloadLength {
-                let contFrame: Data?
-                do {
-                    contFrame = try await withTimeout(frameTimeout) { try await self.connection.receive() }
-                } catch {
-                    throw .fidoConnectionError(error as! FIDOConnectionError, source: .here())
-                }
+                let contFrame = try await receiveFrame()
 
-                guard let contFrame = contFrame else {
-                    throw .timeout(source: .here())
-                }
-                /* Fix trace: trace(message: "Received continuation frame") */
+                logger.traceResponse(contFrame)
 
                 let (contChannelId, sequence, contData) = try parseContinuationFrame(contFrame)
 
@@ -164,17 +173,38 @@ extension FIDOInterface {
                 expectedSequence += 1
             }
 
-            /* Fix trace: trace(message: "Received complete response: \(responsePayload.count) bytes") */
             return responsePayload
         }
+    }
+
+    private func receiveFrame() async throws(Error) -> Data {
+        let frame: Data?
+        do throws(FIDOConnectionError) {
+            frame = try await withTimeoutIgnoringCancellation(frameTimeout) {
+                () async throws(FIDOConnectionError) -> Data in
+                try await self.connection.receive()
+            }
+        } catch {
+            throw .fidoConnectionError(error, source: .here())
+        }
+
+        guard let frame else {
+            throw .timeout(source: .here())
+        }
+        return frame
     }
 
     // MARK: - Sending + Receiving
 
     /// Send CTAP command and wait for response (for commands that don't support KEEPALIVE)
     func sendAndReceive(cmd: UInt8, payload: Data?) async throws(Error) -> Data {
-        try await sendRequest(cmd: cmd, payload: payload)
-        return try await receiveResponse(expectedCommand: cmd)
+        try await withExclusiveOperation { (operationID: UUID) async throws(Error) in
+            guard !Task.isCancelled else {
+                throw Error.fidoConnectionError(.cancelled, source: .here())
+            }
+            try await sendRequest(cmd: cmd, payload: payload)
+            return try await receiveResponse(expectedCommand: cmd, operationID: operationID)
+        }
     }
 
     // MARK: - Frame Building
